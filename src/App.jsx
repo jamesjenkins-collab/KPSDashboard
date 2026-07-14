@@ -6,7 +6,7 @@ import { LayoutDashboard } from 'lucide-react'
 import { ScoreDistribution } from './components/charts/ScoreDistribution'
 import { SubjectDeepDive } from './components/charts/SubjectDeepDive'
 import { Login } from './components/Login'
-import { fetchSheetData, fetchAssessmentData, fetchWellbeingData, SPREADSHEET_ID, SHEET_RANGE, EYFS_SPREADSHEET_ID, EYFS_SHEET_RANGE, CULTURAL_SPREADSHEET_ID, CULTURAL_SHEET_RANGE, TRIPS_SPREADSHEET_ID, SPORTS_TRIPS_SHEET_RANGE } from './lib/googleSheets'
+import { fetchSheetData, fetchAssessmentData, fetchWellbeingData, SPREADSHEET_ID, SHEET_RANGE, EYFS_SPREADSHEET_ID, EYFS_SHEET_RANGE, CULTURAL_SPREADSHEET_ID, CULTURAL_SHEET_RANGE, TRIPS_SPREADSHEET_ID, SPORTS_TRIPS_SHEET_RANGE, STATUTORY_SPREADSHEET_ID, STATUTORY_SHEET_RANGE, updateSheetData } from './lib/googleSheets'
 import { calculatePercentageAtEXSPlus } from './lib/scoreUtils'
 import { AIChat } from './components/AIChat'
 import { EYFSView } from './components/views/EYFSView'
@@ -19,6 +19,7 @@ import { CategoryLandingView } from './components/views/CategoryLandingView'
 import { StudentProfilesListView } from './components/views/StudentProfilesListView'
 import { StudentProfileView } from './components/views/StudentProfileView'
 import { WellbeingView } from './components/views/WellbeingView'
+import { StatutoryAssessmentsView } from './components/views/StatutoryAssessmentsView'
 
 
 const CLIENT_ID = "1065597664453-hdp8mvjr5n8mhgp08k79k9pe43f65l3v.apps.googleusercontent.com";
@@ -32,6 +33,8 @@ function Dashboard() {
   const [culturalData, setCulturalData] = useState([]);
   const [wellbeingData, setWellbeingData] = useState([]);
   const [sportsTripsData, setSportsTripsData] = useState([]);
+  const [statutoryData, setStatutoryData] = useState([]);
+  const [statutorySheetTitle, setStatutorySheetTitle] = useState('25/26');
   const [tripsMetadata, setTripsMetadata] = useState({ upcoming: [], past: [] });
   const [loading, setLoading] = useState(false);
   const [accessToken, setAccessToken] = useState(null);
@@ -86,27 +89,47 @@ function Dashboard() {
     addLog("DATA: Data fetching started");
     setLoading(true);
 
+    // Diagnostic fetch to determine the actual sheet names in the Cultural Capital spreadsheet
+    const metadataUrl = `https://sheets.googleapis.com/v4/spreadsheets/${CULTURAL_SPREADSHEET_ID}?key=AIzaSyACtP5cKvNsZM3EMUv8jb1VZE1NGS08YaI`;
+    fetch(metadataUrl, {
+      headers: { 'Authorization': `Bearer ${accessToken}` }
+    })
+    .then(res => res.json())
+    .then(meta => {
+      if (meta.sheets) {
+        const names = meta.sheets.map(s => s.properties.title);
+        addLog(`DIAGNOSTIC: Cultural Capital Sheets are: ${names.join(', ')}`);
+        console.log("Cultural Capital Sheets:", names);
+      } else {
+        addLog(`DIAGNOSTIC error: ${meta.error?.message || 'unknown error'}`);
+      }
+    })
+    .catch(err => {
+      addLog(`DIAGNOSTIC error fetching metadata: ${err.message}`);
+    });
+
     // Fetch Cultural Capital & Trips
     Promise.all([
       fetchSheetData(accessToken, CULTURAL_SPREADSHEET_ID, CULTURAL_SHEET_RANGE),
-      fetchSheetData(accessToken, TRIPS_SPREADSHEET_ID, 'Upcoming!A:E').catch(err => {
-        console.warn("Upcoming trips sheet not found or inaccessible:", err);
-        return [];
-      }),
-      fetchSheetData(accessToken, TRIPS_SPREADSHEET_ID, 'Previous!A:E').catch(err => {
-        console.warn("Previous trips sheet not found or inaccessible:", err);
+      fetchSheetData(accessToken, CULTURAL_SPREADSHEET_ID, 'EVS!A:Z').catch(err => {
+        console.warn("EVS trips tab not found or inaccessible:", err);
         return [];
       }),
       fetchSheetData(accessToken, CULTURAL_SPREADSHEET_ID, 'Sports Trips!A:AZ', true).catch(err => {
         console.warn("Sports trips sheet not found or inaccessible:", err);
         return [];
       })
-    ]).then(([culturalRows, upcomingTrips, previousTrips, sportsTripsRaw]) => {
+    ]).then(([culturalRows, evsRows, sportsTripsRaw]) => {
 
 
       addLog(`DATA: Fetched ${culturalRows.length} cultural rows`);
-      addLog(`DATA: Fetched ${upcomingTrips.length} upcoming trips and ${previousTrips.length} previous trips`);
+      addLog(`DATA: Fetched ${evsRows.length} EVS trips rows`);
       addLog(`DATA: Fetched ${sportsTripsRaw ? sportsTripsRaw.length : 0} rows of sports trips data`);
+
+      if (evsRows.length > 0) {
+        addLog(`DIAGNOSTIC: EVS Row 0 keys: ${Object.keys(evsRows[0]).join(', ')}`);
+        addLog(`DIAGNOSTIC: EVS Row 0 sample: ${JSON.stringify(evsRows[0])}`);
+      }
 
       // 1. Calculate Cohort Sizes from the actual student data
       const cohortCounts = {};
@@ -117,72 +140,30 @@ function Dashboard() {
         }
       });
 
-      // 2. Process Trips and identify which ones to auto-attach
-      const tripsToAttach = {}; // YearGroup -> [TripNames]
-
-      const processTrips = (trips, type) => {
-        return trips.map(trip => {
-          // header mapping: Trip Date(s) -> tripDate(s), Trip Name -> tripName, Groups -> groups, Participants -> participants
-          const tName = trip['tripName'];
-          const tGroups = trip['groups']; // e.g. "Year 6"
-          const tParticipants = parseInt(trip['participants']) || 0;
-
-          // Check for rough match (±10%)
-          // The user said "Groups - this is the year groups who attended". 
-          // We can check if the group name contains a year group we have, or just rely on participants count if group matches?
-          // Simplest: Check if 'groups' string matches a known year group key in cohortCounts
-          // AND if participants is close to cohortCounts[group]
-
-          // Split 'groups' by comma just in case "Year 5, Year 6"
-          if (tGroups) {
-            const statedGroups = tGroups.split(',').map(s => s.trim());
-            statedGroups.forEach(groupName => {
-              // Attempt to match groupName to our cohort keys (e.g. "Year 6" -> "Year 6")
-              // Sometimes sheet has "Y6", "6", "Year 6". We might need normalization, but let's assume direct match first based on user desc.
-
-              const targetSize = cohortCounts[groupName];
-              if (targetSize) {
-                const diff = Math.abs(tParticipants - targetSize);
-                const variance = targetSize * 0.15; // 15% variance to be safe
-
-                if (diff <= variance) {
-                  // It's a match! Attach this trip to this year group
-                  if (!tripsToAttach[groupName]) tripsToAttach[groupName] = [];
-                  tripsToAttach[groupName].push(tName);
-                }
-              }
-            });
-          }
-          return { ...trip, type };
-        });
-      };
-
-      const processedUpcoming = processTrips(upcomingTrips, 'upcoming');
-      const processedPrevious = processTrips(previousTrips, 'past');
-
-      setTripsMetadata({
-        upcoming: processedUpcoming,
-        past: processedPrevious,
-        all: [...processedUpcoming, ...processedPrevious]
+      // 2. Build UPN to EVS Trips map
+      const evsMap = new Map();
+      (evsRows || []).forEach(row => {
+        const u = row.upn || row.UPN || row.uPN;
+        if (u) {
+          const cleanUpn = String(u).trim().toUpperCase();
+          const tripsVal = row.tripsThisAcademicYear || row.trips || row.Trips || '';
+          evsMap.set(cleanUpn, tripsVal);
+        }
       });
 
+      setTripsMetadata({
+        upcoming: [],
+        past: [],
+        all: []
+      });
+
+      let matchCount = 0;
       const normalizedRows = culturalRows.map(row => {
         const yg = row['yearGroup(s)ThisAcademicYear'];
-        let existingTrips = row['tripsThisAcademicYear'] || '';
-
-        // Append attached trips - DEPRECATED via User Request
-        // User confirmed "all trips attended" are in the manual column I.
-        // So we do NOT auto-attach based on Year Group anymore.
-        /*
-        if (yg && tripsToAttach[yg]) {
-          const autoTrips = tripsToAttach[yg].join(', ');
-          if (existingTrips) {
-            existingTrips = existingTrips + ', ' + autoTrips;
-          } else {
-            existingTrips = autoTrips;
-          }
-        }
-        */
+        const u = row.upn || row.UPN || row.uPN;
+        const cleanUpn = u ? String(u).trim().toUpperCase() : '';
+        const existingTrips = cleanUpn ? (evsMap.get(cleanUpn) || '') : '';
+        if (existingTrips) matchCount++;
 
         return {
           ...row,
@@ -192,10 +173,11 @@ function Dashboard() {
           sen: row['sENAtAnyTimeThisAcademicYear?'] === 'Yes' ? 'K' : 'N',
           sex: row['sex'],
           leavingDate: row['leavingDate'],
-          tripsThisAcademicYear: existingTrips // Updated with auto-attached trips
+          tripsThisAcademicYear: existingTrips
         };
       });
 
+      addLog(`DIAGNOSTIC: Mapped EVS trips for ${matchCount} out of ${culturalRows.length} students`);
       setCulturalData(normalizedRows);
 
       // 3. Process Sports Trips (Updated User Request: 2 cols per trip: UPN, Name)
@@ -276,6 +258,60 @@ function Dashboard() {
         addLog(`ERROR Wellbeing: ${err.message}`);
         console.error("Wellbeing Fetch Error", err);
       });
+
+    // Fetch Statutory Data
+    fetch(`https://sheets.googleapis.com/v4/spreadsheets/${STATUTORY_SPREADSHEET_ID}`, {
+      headers: { 'Authorization': `Bearer ${accessToken}` }
+    })
+      .then(res => {
+        if (!res.ok) {
+          throw new Error(`HTTP error! status: ${res.status}`);
+        }
+        return res.json();
+      })
+      .then(meta => {
+        if (meta.sheets) {
+          const names = meta.sheets.map(s => s.properties.title);
+          addLog(`DIAGNOSTIC: Statutory Sheets are: ${names.join(', ')}`);
+          
+          let bestTitle = '25/26';
+          if (names.includes('25/26')) {
+            bestTitle = '25/26';
+          } else if (names.includes('Statutory Assessments')) {
+            bestTitle = 'Statutory Assessments';
+          } else if (names.includes('Sheet1')) {
+            bestTitle = 'Sheet1';
+          } else if (names.length > 0) {
+            bestTitle = names[0];
+          }
+          setStatutorySheetTitle(bestTitle);
+          
+          addLog(`DATA: Fetching statutory data from sheet tab: ${bestTitle}`);
+          fetchSheetData(accessToken, STATUTORY_SPREADSHEET_ID, `'${bestTitle}'!A:ZZ`)
+            .then(rows => {
+              addLog(`DATA: Fetched ${rows.length} statutory records`);
+              setStatutoryData(rows);
+            })
+            .catch(err => {
+              addLog(`ERROR Statutory rows: ${err.message}`);
+              console.error(err);
+            });
+        }
+      })
+      .catch(err => {
+        addLog(`ERROR Statutory meta: ${err.message}`);
+        console.error(err);
+        // Fallback to direct fetch
+        addLog(`DATA: Falling back to direct fetch with range ${STATUTORY_SHEET_RANGE}`);
+        fetchSheetData(accessToken, STATUTORY_SPREADSHEET_ID, STATUTORY_SHEET_RANGE)
+          .then(rows => {
+            addLog(`DATA: Fetched ${rows.length} statutory records via fallback`);
+            setStatutoryData(rows);
+          })
+          .catch(e => {
+            addLog(`ERROR Statutory fallback: ${e.message}`);
+          });
+      });
   };
 
   const activeData = useMemo(() => {
@@ -292,10 +328,26 @@ function Dashboard() {
     const studentMap = new Map();
     assessmentData.forEach(record => {
       if (record.upn && !studentMap.has(record.upn)) {
+        let yg = record.yearGroup || '';
+        const normYg = yg.toLowerCase().trim();
+        if (!yg || normYg === 'n/a' || normYg === 'unknown' || normYg === 'yes' || normYg === 'no') {
+          if (record.registrationForm) {
+            const form = record.registrationForm.toLowerCase();
+            const numberMatch = form.match(/\d+/);
+            if (numberMatch) {
+              yg = `Year ${numberMatch[0]}`;
+            } else if (form.includes('rec') || form.startsWith('r')) {
+              yg = "Reception";
+            } else if (form.includes('nur') || form.startsWith('n')) {
+              yg = "Nursery";
+            }
+          }
+        }
+
         studentMap.set(record.upn, {
           upn: record.upn,
           name: record.name,
-          yearGroup: record.yearGroup,
+          yearGroup: yg,
           registrationForm: record.registrationForm,
           sex: record.sex,
           pupilPremium: record.pupilPremium,
@@ -578,6 +630,102 @@ function Dashboard() {
     addLog("LOGOUT: User signed out");
   };
 
+  const handleSaveStatutory = async (newStudents) => {
+    try {
+      addLog("SAVE: Preparing statutory data...");
+      
+      const recordMap = new Map();
+
+      // Seed with existing data
+      statutoryData.forEach(row => {
+        const normU = String(row.upn || '').toUpperCase().replace(/[^A-Z0-9]/g, '').trim();
+        const stage = String(row.stage || '').trim();
+        const rawSub = String(row.rawSubject || row.subject || '').trim();
+        const comp = String(row.component || '').trim();
+        const key = `${normU}-${stage}-${rawSub}-${comp}`;
+        
+        recordMap.set(key, {
+          upn: String(row.upn || '').trim(),
+          name: row.name,
+          stage: row.stage,
+          subject: row.subject,
+          result: row.result,
+          mark: row.mark || '',
+          date: row.date,
+          rawSubject: row.rawSubject || '',
+          component: row.component || '',
+          specialConsideration: row.specialConsideration || 'No',
+          disapplied: row.disapplied || 'No'
+        });
+      });
+
+      // Update/insert new student records
+      newStudents.forEach(s => {
+        s.assessments.forEach(a => {
+          const normU = String(s.upn || '').toUpperCase().replace(/[^A-Z0-9]/g, '').trim();
+          const stage = String(a.stage || '').trim();
+          const rawSub = String(a.rawSubject || a.subject || '').trim();
+          const comp = String(a.component || '').trim();
+          const key = `${normU}-${stage}-${rawSub}-${comp}`;
+          
+          recordMap.set(key, {
+            upn: String(s.upn || '').trim(),
+            name: s.name,
+            stage: a.stage,
+            subject: a.subject,
+            result: a.result,
+            mark: a.mark || '',
+            date: a.date,
+            rawSubject: a.rawSubject || '',
+            component: a.component || '',
+            specialConsideration: a.specialConsideration || 'No',
+            disapplied: a.disapplied || 'No'
+          });
+        });
+      });
+
+      const mergedList = Array.from(recordMap.values());
+      const payload = [];
+      
+      payload.push([
+        "UPN", "Name", "Stage", "Subject", "Result", "Mark", "Date", "Raw Subject", "Component", "Special Consideration", "Disapplied"
+      ]);
+
+      mergedList.forEach(r => {
+        payload.push([
+          r.upn,
+          r.name,
+          r.stage,
+          r.subject,
+          r.result,
+          r.mark,
+          r.date,
+          r.rawSubject,
+          r.component,
+          r.specialConsideration,
+          r.disapplied
+        ]);
+      });
+
+      if (payload.length === 0) return false;
+
+      if (accessToken) {
+        const syncRange = `'${statutorySheetTitle}'!A1`;
+        await updateSheetData(accessToken, STATUTORY_SPREADSHEET_ID, syncRange, payload);
+      } else {
+        addLog("SAVE (MOCK): Bypassed Google Sheets write in mock mode");
+      }
+      
+      setStatutoryData(mergedList);
+      addLog(`SAVE: Persisted ${mergedList.length} assessment records (merged)`);
+      return true;
+    } catch (err) {
+      addLog(`ERROR: Save failed: ${err.message}`);
+      console.error("Save statutory error:", err);
+      throw err;
+    }
+  };
+
   if (!user) {
     return <Login onSuccess={handleLoginSuccess} />;
   }
@@ -696,6 +844,32 @@ function Dashboard() {
               studentData={assessmentData}
             />
           )}
+
+          {/* View: Statutory Assessments */}
+          {currentView === 'statutoryAssessments' && (
+            <StatutoryAssessmentsView
+              persistedData={statutoryData}
+              mainData={allStudents}
+              onSave={handleSaveStatutory}
+              accessToken={accessToken}
+              sheetTabName={statutorySheetTitle}
+            />
+          )}
+
+          {/* System Diagnostics Logs */}
+          <div className="max-w-7xl mx-auto mt-8 bg-gray-950 text-emerald-400 p-4 font-mono text-xs rounded-xl border border-gray-800 shadow-lg">
+            <div className="flex justify-between items-center mb-2 pb-2 border-b border-gray-800">
+              <span className="font-bold text-gray-300">System Diagnostics</span>
+              <span className="text-gray-500">Local Dev Console</span>
+            </div>
+            <div className="max-h-40 overflow-y-auto space-y-1">
+              {logs.length === 0 ? (
+                <div className="text-gray-500">No logs generated yet.</div>
+              ) : (
+                logs.map((log, i) => <div key={i}>{log}</div>)
+              )}
+            </div>
+          </div>
 
         </main>
       </div>

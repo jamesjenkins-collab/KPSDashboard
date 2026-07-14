@@ -81,6 +81,7 @@ export function CategoryLandingView({ categoryId, onNavigate, onBack }) {
             items: [
                 { id: 'dashboard', label: 'Assessment Dashboard', icon: LayoutDashboard },
                 { id: 'progress', label: 'Progress Tracking', icon: TrendingUp },
+                { id: 'statutoryAssessments', label: 'Statutory Assessments', icon: Trophy },
             ]
         },
         'cat_attendance_behaviour': {
